@@ -127,30 +127,78 @@ function dibujarLista(array, containerId, msjVacio) {
     });
 }
 
-// Importar DBF
+// ========================================
+// MEJORADO: Importar DBF con mejor feedback
+// ========================================
 document.getElementById('dbfUpload').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
 
-    const formData = new FormData();
-    formData.append('dbfFile', file);
+    // Validar que sea archivo DBF
+    if (!file.name.toLowerCase().endsWith('.dbf')) {
+        alert('❌ Por favor selecciona un archivo .dbf válido');
+        e.target.value = '';
+        return;
+    }
 
-    document.getElementById('modalLoader').classList.remove('hidden');
+    // Mostrar loader
+    const loaderDiv = document.getElementById('modalLoader');
+    const loaderMessage = document.getElementById('loaderMessage');
+    const progressBar = document.getElementById('progressBar');
+    
+    loaderDiv.classList.remove('hidden');
+    loaderMessage.textContent = `📥 Leyendo archivo: ${file.name}...`;
+    progressBar.style.width = '0%';
 
     try {
+        // Crear FormData
+        const formData = new FormData();
+        formData.append('dbfFile', file);
+
+        // Enviar archivo
         const response = await fetch(`${API_URL}/importar-dbf`, {
             method: 'POST',
             body: formData
         });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Error en la importación');
+        }
+
         const result = await response.json();
         
-        alert(`✅ Importación exitosa!\n\nTotal: ${result.total}\nInsertados: ${result.insertados}\nErrores: ${result.errores}`);
-        actualizarEstadisticas();
+        // Actualizar progress bar
+        progressBar.style.width = '100%';
+        loaderMessage.textContent = `✅ Importación completada`;
+
+        // Mostrar resultado detallado
+        setTimeout(() => {
+            const mensaje = `
+✅ IMPORTACIÓN EXITOSA
+
+📊 Estadísticas:
+   • Total de registros: ${result.total.toLocaleString('es-MX')}
+   • Insertados: ${result.insertados.toLocaleString('es-MX')}
+   • Errores: ${result.errores.toLocaleString('es-MX')}
+   
+${result.errores > 0 ? '⚠️ Verifica que no haya registros duplicados por FOLIO o CURP' : '🎉 Todos los registros se importaron correctamente'}`;
+            
+            alert(mensaje);
+            actualizarEstadisticas();
+            loaderDiv.classList.add('hidden');
+        }, 800);
+
     } catch (error) {
-        alert('❌ Error en la importación: ' + error.message);
+        progressBar.style.width = '0%';
+        loaderMessage.textContent = `❌ Error: ${error.message}`;
+        
+        setTimeout(() => {
+            alert(`❌ Error en la importación:\n\n${error.message}`);
+            loaderDiv.classList.add('hidden');
+        }, 1000);
     } finally {
-        document.getElementById('modalLoader').classList.add('hidden');
-        e.target.value = '';
+        e.target.value = ''; // Limpiar input
     }
 });
 
