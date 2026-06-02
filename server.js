@@ -11,9 +11,13 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
-app.use(fileUpload({ useTempFiles: true }));
+app.use(bodyParser.json({ limit: '100mb' }));
+app.use(bodyParser.urlencoded({ limit: '100mb', extended: true }));
+app.use(fileUpload({ 
+    useTempFiles: true,
+    tempFileDir: '/tmp/',
+    limits: { fileSize: 500 * 1024 * 1024 } // 500MB
+}));
 app.use(express.static('public'));
 
 // Crear carpeta de BD si no existe
@@ -27,9 +31,24 @@ const db = new sqlite3.Database(dbPath, (err) => {
 });
 
 // ========================================
-// CREAR TABLA OPTIMIZADA
+// OPTIMIZACIONES PARA GRAN VOLUMEN
+// ========================================
+
+// Desactivar fsync durante importación masiva
+db.configure('busyTimeout', 30000); // 30 segundos
+
+// ========================================
+// CREAR TABLA OPTIMIZADA CON WAL MODE
 // ========================================
 db.serialize(() => {
+    // Habilitar WAL mode para mejor concurrencia
+    db.run('PRAGMA journal_mode = WAL');
+    db.run('PRAGMA synchronous = NORMAL');
+    db.run('PRAGMA cache_size = -64000'); // 64MB cache
+    db.run('PRAGMA temp_store = MEMORY');
+    db.run('PRAGMA mmap_size = 30000000'); // Memory-mapped I/O
+    db.run('PRAGMA page_size = 4096');
+
     db.run(`
         CREATE TABLE IF NOT EXISTS actas_nacimiento (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +84,7 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_folio ON actas_nacimiento(folio)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_entidad ON actas_nacimiento(entidad)`);
 
-    console.log('✅ Tabla de actas creada con índices optimizados');
+    console.log('✅ Tabla de actas creada con optimizaciones para gran volumen');
 });
 
 // ========================================
@@ -99,7 +118,7 @@ const promiseDb = {
 };
 
 // ========================================
-// LECTOR DBF BINARIO MEJORADO
+// LECTOR DBF BINARIO OPTIMIZADO
 // ========================================
 function readDBFBuffer(buffer) {
     try {
@@ -124,9 +143,16 @@ function readDBFBuffer(buffer) {
         const records = [];
         let recordOffset = headerLength;
         const decoder = new TextDecoder('iso-8859-1');
-        const limit = Math.min(numRecords, 5000000); // Hasta 5M registros por archivo
+        // Soportar hasta 3.6M registros
+        const limit = Math.min(numRecords, 3600000);
 
+        console.log(`📖 Leyendo ${limit.toLocaleString('es-MX')} registros...`);
+        
         for (let i = 0; i < limit; i++) {
+            if (i % 500000 === 0 && i > 0) {
+                console.log(`  ⏳ Procesados ${i.toLocaleString('es-MX')} registros...`);
+            }
+            
             const isDeleted = view.getUint8(recordOffset) === 0x2A;
             if (!isDeleted) {
                 let fieldOffset = recordOffset + 1;
@@ -143,6 +169,7 @@ function readDBFBuffer(buffer) {
             recordOffset += recordLength;
         }
 
+        console.log(`✅ Lectura completada: ${records.length.toLocaleString('es-MX')} registros leídos`);
         return records;
     } catch (error) {
         throw new Error(`Error al parsear DBF: ${error.message}`);
@@ -240,7 +267,7 @@ app.post('/api/acta/crear', async (req, res) => {
             materno.toUpperCase(), sexo.toUpperCase(), fecha_nac, lugar_nac.toUpperCase(),
             padre1.toUpperCase(), padre2.toUpperCase(), nac1, nac2,
             abueloP1.toUpperCase(), abuelaP2.toUpperCase(), 
-            abueloM1.toUpperCase(), abuelaM2.toUpperCase(),
+            abueloM1.toUpperCase(), abueloM2.toUpperCase(),
             entidad || 'MÉXICO', municipio || 'REGISTRO LOCAL',
             new Date().getFullYear().toString()
         ]);
@@ -256,7 +283,7 @@ app.post('/api/acta/crear', async (req, res) => {
     }
 });
 
-// POST: Importar archivo DBF
+// POST: Importar archivo DBF - OPTIMIZADO PARA GRAN VOLUMEN
 app.post('/api/importar-dbf', async (req, res) => {
     try {
         if (!req.files || !req.files.dbfFile) {
@@ -270,13 +297,16 @@ app.post('/api/importar-dbf', async (req, res) => {
             return res.status(400).json({ error: 'El archivo debe ser formato .dbf' });
         }
 
-        console.log(`📥 Procesando archivo: ${fileName}`);
+        console.log(`\n📥 INICIANDO IMPORTACIÓN: ${fileName}`);
+        console.log(`📊 Tamaño del archivo: ${(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB`);
+        
+        const startTime = Date.now();
         
         // Leer archivo en buffer
         const buffer = uploadedFile.data;
         const recordsRaw = readDBFBuffer(buffer);
 
-        console.log(`📊 Total de registros a importar: ${recordsRaw.length}`);
+        console.log(`📊 Total de registros a importar: ${recordsRaw.length.toLocaleString('es-MX')}`);
 
         // Preparar datos mapeados
         const recordsMapped = recordsRaw.map((row, index) => {
@@ -307,13 +337,18 @@ app.post('/api/importar-dbf', async (req, res) => {
             };
         });
 
-        // Insertar en lotes de 5000 registros
-        const batchSize = 5000;
+        // Insertar en lotes GRANDES para mejor rendimiento
+        const batchSize = 10000; // Aumentado a 10,000 para gran volumen
         let insertados = 0;
         let errores = 0;
+        let batchNumber = 0;
+
+        console.log(`\n🔄 Iniciando inserción en lotes de ${batchSize.toLocaleString('es-MX')}...`);
 
         for (let i = 0; i < recordsMapped.length; i += batchSize) {
+            batchNumber++;
             const batch = recordsMapped.slice(i, i + batchSize);
+            const batchStartTime = Date.now();
             
             for (const rec of batch) {
                 try {
@@ -335,15 +370,29 @@ app.post('/api/importar-dbf', async (req, res) => {
                 }
             }
             
-            console.log(`⏳ Progreso: ${i + batchSize}/${recordsMapped.length} registros procesados`);
+            const batchTime = ((Date.now() - batchStartTime) / 1000).toFixed(2);
+            const progressPercent = Math.min(100, Math.round((i + batchSize) / recordsMapped.length * 100));
+            console.log(`  ⏳ Lote ${batchNumber}: ${(i + batchSize).toLocaleString('es-MX')}/${recordsMapped.length.toLocaleString('es-MX')} (${progressPercent}%) - ${batchTime}s`);
         }
+
+        const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
+        const recordsPerSecond = Math.round(insertados / parseFloat(totalTime));
+
+        console.log(`\n✅ IMPORTACIÓN COMPLETADA`);
+        console.log(`   Total procesados: ${recordsMapped.length.toLocaleString('es-MX')}`);
+        console.log(`   Insertados correctamente: ${insertados.toLocaleString('es-MX')}`);
+        console.log(`   Errores: ${errores.toLocaleString('es-MX')}`);
+        console.log(`   Tiempo total: ${totalTime}s`);
+        console.log(`   Velocidad: ${recordsPerSecond.toLocaleString('es-MX')} registros/segundo\n`);
 
         res.json({
             success: true,
             total: recordsMapped.length,
             insertados,
             errores,
-            mensaje: `✅ Importación completada: ${insertados} registros insertados, ${errores} errores`
+            time: parseFloat(totalTime),
+            speed: recordsPerSecond,
+            mensaje: `✅ Importación completada en ${totalTime}s: ${insertados.toLocaleString('es-MX')} registros insertados, ${errores.toLocaleString('es-MX')} errores`
         });
 
     } catch (error) {
@@ -430,6 +479,7 @@ app.listen(PORT, () => {
 ║  🏛️  REGISTRO CIVIL - MÉXICO            ║
 ║     Servidor corriendo en:              ║
 ║     http://localhost:${PORT}                ║
+║  🚀 Optimizado para 3.6M+ registros    ║
 ╚════════════════════════════════════════╝
     `);
 });
